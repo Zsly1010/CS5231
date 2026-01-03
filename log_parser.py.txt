@@ -1,0 +1,95 @@
+import json
+import os
+from py2neo import Graph, Node, Relationship
+
+# --- 配置区 ---
+# !! 请确保日志文件名和路径是正确的
+log_file_path = os.path.expanduser('~/proj_tools/audit_out/auditbeat-20250920.ndjson')
+NEO4J_URI = "bolt://localhost:7687"
+NEO4J_USER = "neo4j"
+# !! 在这里填入你的Neo4j新密码
+NEO4J_PASSWORD = "123456" # <--- 在这里填入你的新密码
+
+# --- 主程序区 ---
+def create_graph_from_logs():
+    print("[*] 开始连接到Neo4j数据库...")
+    try:
+        graph = Graph(NEO4J_URI, auth=(NEO4J_USER, NEO4J_PASSWORD))
+        # 重新运行时清空数据库
+        graph.delete_all()
+        print("[+] 成功连接到Neo4j并清空数据库。")
+    except Exception as e:
+        print(f"[!] 错误：无法连接到Neo4j数据库: {e}")
+        return
+
+    print(f"[*] 开始解析日志文件: {log_file_path}")
+    if not os.path.exists(log_file_path):
+        print(f"[!] 错误: 日志文件未找到于 {log_file_path}")
+        return
+
+    with open(log_file_path, 'r') as f:
+        for line in f:
+            try:
+                log_entry = json.loads(line)
+
+                # --- V2版 提取代码 ---
+                # 1. 提取核心进程信息
+                process_pid = log_entry.get('process', {}).get('pid')
+                process_name = log_entry.get('process', {}).get('name')
+                process_exe = log_entry.get('process', {}).get('executable')
+                process_args_list = log_entry.get('process', {}).get('args')
+
+                # 将参数列表 (如果存在) 转换成一个字符串
+                process_args = ' '.join(process_args_list) if isinstance(process_args_list, list) else None
+
+                if process_pid:
+                    # 2. 创建或更新进程节点 (Node)
+                    # 我们现在把所有信息都存入节点属性
+                    proc_node = Node("Process", pid=process_pid)
+                    
+                    if process_name:
+                        proc_node["name"] = process_name
+                    if process_exe:
+                        proc_node["executable"] = process_exe
+                    if process_args:
+                        proc_node["args"] = process_args
+                    
+                    # 根据PID合并, 确保节点唯一
+                    graph.merge(proc_node, "Process", "pid") 
+
+                    # 3. 创建父子关系 (Relationship)
+                    parent_pid = log_entry.get('process', {}).get('parent', {}).get('pid')
+                    if parent_pid:
+                        # 确保父节点也存在
+                        parent_node = Node("Process", pid=parent_pid)
+                        graph.merge(parent_node, "Process", "pid")
+                        
+                        # 创建关系
+                        rel = Relationship(parent_node, "CREATED", proc_node)
+                        # 使用merge来避免重复创建关系
+                        graph.merge(rel) 
+
+                    # 4. 创建文件访问关系 (Relationship)
+                    file_path = log_entry.get('file', {}).get('path')
+                    syscall = log_entry.get('auditd', {}).get('data', {}).get('syscall')
+
+                    # 我们只关心这几类文件访问
+                    if file_path and syscall in ['open', 'openat', 'creat', 'read']:
+                        # 确保文件节点存在
+                        file_node = Node("File", path=file_path)
+                        graph.merge(file_node, "File", "path")
+                        
+                        # 创建关系, 并把syscall作为关系的一个属性
+                        # 这里用create, 因为每次访问都是一个独立事件
+                        rel = Relationship(proc_node, "ACCESSED_FILE", file_node, type=syscall)
+                        graph.create(rel)
+                
+            except (json.JSONDecodeError, KeyError, TypeError):
+                # 跳过任何格式不正确的日志行
+                continue
+
+    print("[*] 日志文件解析并导入Neo4j完毕。")
+
+# --- 脚本入口 ---
+if __name__ == "__main__":
+    create_graph_from_logs()
